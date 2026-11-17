@@ -55,8 +55,8 @@ HX711_t loadcell1 = {
     .dout_pin = GPIO_PIN_0,
     .sck_port = GPIOA,
     .sck_pin = GPIO_PIN_1,
-    .offset = 0,
-    .scale = 0.0f
+    .offset = 13229,
+    .scale = 25848.474609f
 };
 
 HX711_t loadcell2 = {
@@ -288,26 +288,29 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   if (HAL_TIM_Base_Start(&htim2) != HAL_OK)
+  {
       Error_Handler();
+  }
 
-  // Allow the HX711 to stabilize.
   HAL_Delay(2000);
 
   Serial_Print("\r\nSTM32 DUAL HX711 SYSTEM STARTED\r\n");
 
-  while (!Calibrate_LoadCell(&loadcell1, "Axial load cell"))
-  {
-      Serial_Print("Axial calibration failed. Retry.\r\n");
-      HAL_Delay(1000);
-  }
+  // Axial load cell uses hardcoded calibration.
+  Serial_Print("\r\nAxial load cell calibration loaded.\r\n");
+  Serial_Print("Offset: 13229 counts\r\n");
+  Serial_Print("Scale: 25848.474609 counts/lb\r\n");
+
+  // Calibrate only the horizontal load cell.
+  Serial_Print("\r\nCalibrating horizontal load cell...\r\n");
 
   while (!Calibrate_LoadCell(&loadcell2, "Horizontal load cell"))
   {
-      Serial_Print("Horizontal calibration failed. Retry.\r\n");
+      Serial_Print("Calibration failed. Retrying...\r\n");
       HAL_Delay(1000);
   }
 
-  Serial_Print("\r\nBoth sensors calibrated.\r\n");
+  Serial_Print("\r\nBoth load cells ready!\r\n");
   Serial_Print("Commands (send one character): t = tare both, r = recalibrate both\r\n");
 
   /* USER CODE END 2 */
@@ -348,12 +351,12 @@ int main(void)
           }
           else if (command == 'r')
           {
-              Serial_Print("Recalibrating both sensors.\r\n");
-              while (!Calibrate_LoadCell(&loadcell1, "Axial load cell"))
-                  Serial_Print("Axial calibration failed. Retry.\r\n");
-              while (!Calibrate_LoadCell(&loadcell2, "Horizontal load cell"))
-                  Serial_Print("Horizontal calibration failed. Retry.\r\n");
-              Serial_Print("Both sensors calibrated.\r\n");
+              Serial_Print("\r\nRecalibrating horizontal load cell...\r\n");
+
+              if (!Calibrate_LoadCell(&loadcell2, "Horizontal load cell"))
+              {
+                  Serial_Print("ERROR: Recalibration failed!\r\n");
+              }
           }
       }
 
