@@ -64,8 +64,8 @@ HX711_t loadcell2 = {
     .dout_pin = GPIO_PIN_0,
     .sck_port = GPIOB,
     .sck_pin = GPIO_PIN_1,
-    .offset = 0,
-    .scale = 0.0f
+    .offset = 585800,
+    .scale = 97598.601562f
 };
 
 volatile float weight1_lb = 0.0f;
@@ -301,17 +301,13 @@ int main(void)
   Serial_Print("Offset: 13229 counts\r\n");
   Serial_Print("Scale: 25848.474609 counts/lb\r\n");
 
-  // Calibrate only the horizontal load cell.
-  Serial_Print("\r\nCalibrating horizontal load cell...\r\n");
+  // Horizontal load cell also uses hardcoded calibration.
+  Serial_Print("\r\nHorizontal load cell calibration loaded.\r\n");
+  Serial_Print("Offset: 585800 counts\r\n");
+  Serial_Print("Scale: 97598.601562 counts/lb\r\n");
 
-  while (!Calibrate_LoadCell(&loadcell2, "Horizontal load cell"))
-  {
-      Serial_Print("Calibration failed. Retrying...\r\n");
-      HAL_Delay(1000);
-  }
-
-  Serial_Print("\r\nBoth load cells ready!\r\n");
-  Serial_Print("Commands (send one character): t = tare both, r = recalibrate both\r\n");
+  Serial_Print("\r\nBoth load cells ready for measurements!\r\n");
+  Serial_Print("Commands (send one character): t = tare both, r = recalibrate horizontal\r\n");
 
   /* USER CODE END 2 */
 
