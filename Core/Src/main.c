@@ -50,8 +50,27 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-HX711_t loadcell = {0};
-volatile float measured_weight_lb = 0.0f;
+HX711_t loadcell1 = {
+    .dout_port = GPIOA,
+    .dout_pin = GPIO_PIN_0,
+    .sck_port = GPIOA,
+    .sck_pin = GPIO_PIN_1,
+    .offset = 0,
+    .scale = 0.0f
+};
+
+HX711_t loadcell2 = {
+    .dout_port = GPIOB,
+    .dout_pin = GPIO_PIN_0,
+    .sck_port = GPIOB,
+    .sck_pin = GPIO_PIN_1,
+    .offset = 0,
+    .scale = 0.0f
+};
+
+volatile float weight1_lb = 0.0f;
+volatile float weight2_lb = 0.0f;
+
 char uart_buffer[100];
 /* USER CODE END PV */
 
@@ -67,7 +86,7 @@ static void MX_USART2_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-#define GRAVITY 9.80665f
+
 
 // Transmit text over UART.
 static void Serial_Print(const char *message)
@@ -137,15 +156,33 @@ static void Serial_PrintWeight(float pounds)
     Serial_Print(uart_buffer);
 }
 
+
+
+static void Serial_PrintCalibration(HX711_t *hx, const char *name)
+{
+    char buffer[160];
+    Serial_Print("\r\n========== CALIBRATION PARAMETERS ==========\r\n");
+    snprintf(buffer, sizeof(buffer), "%s\r\n", name);
+    Serial_Print(buffer);
+    snprintf(buffer, sizeof(buffer), "Offset: %ld counts\r\n", (long)hx->offset);
+    Serial_Print(buffer);
+    snprintf(buffer, sizeof(buffer), "Scale: %.6f counts/lb\r\n", (double)hx->scale);
+    Serial_Print(buffer);
+    Serial_Print("Save these for future hardcoded initialization.\r\n");
+}
+
+
 // Interactive calibration routine.
-static bool Calibrate_LoadCell(void)
+static bool Calibrate_LoadCell(HX711_t *hx, const char *name)
 {
     char input[40];
     float known_weight_lb;
 
     Serial_Print("\r\n");
     Serial_Print("============================\r\n");
-    Serial_Print(" HX711 CALIBRATION\r\n");
+    Serial_Print(" HX711 CALIBRATION: ");
+    Serial_Print(name);
+    Serial_Print("\r\n");
     Serial_Print("============================\r\n");
 
     Serial_Print("\r\nSTEP 1: TARE\r\n");
@@ -164,7 +201,7 @@ static bool Calibrate_LoadCell(void)
 
     Serial_Print("Taring... please wait.\r\n");
 
-    if (!HX711_Tare(&loadcell))
+    if (!HX711_Tare(hx))
     {
         Serial_Print("ERROR: Tare failed.\r\n");
         return false;
@@ -199,7 +236,7 @@ static bool Calibrate_LoadCell(void)
 
     Serial_Print("Calibrating... please wait.\r\n");
 
-    if (!HX711_Calibrate(&loadcell, known_weight_lb))
+    if (!HX711_Calibrate(hx, known_weight_lb))
     {
         Serial_Print("ERROR: Calibration failed.\r\n");
         return false;
@@ -208,9 +245,9 @@ static bool Calibrate_LoadCell(void)
     Serial_Print("\r\nCalibration completed!\r\n");
     Serial_PrintWeight(known_weight_lb);
 
-    Serial_Print("\r\nCommands:\r\n");
-    Serial_Print("t = Tare\r\n");
-    Serial_Print("r = Recalibrate\r\n");
+    Serial_PrintCalibration(hx, name);
+
+
 
     return true;
 }
@@ -256,13 +293,22 @@ int main(void)
   // Allow the HX711 to stabilize.
   HAL_Delay(2000);
 
-  Serial_Print("\r\nSTM32 HX711 SYSTEM STARTED\r\n");
+  Serial_Print("\r\nSTM32 DUAL HX711 SYSTEM STARTED\r\n");
 
-  while (!Calibrate_LoadCell())
+  while (!Calibrate_LoadCell(&loadcell1, "Axial load cell"))
   {
-      Serial_Print("Calibration failed. Retrying...\r\n");
+      Serial_Print("Axial calibration failed. Retry.\r\n");
       HAL_Delay(1000);
   }
+
+  while (!Calibrate_LoadCell(&loadcell2, "Horizontal load cell"))
+  {
+      Serial_Print("Horizontal calibration failed. Retry.\r\n");
+      HAL_Delay(1000);
+  }
+
+  Serial_Print("\r\nBoth sensors calibrated.\r\n");
+  Serial_Print("Commands (send one character): t = tare both, r = recalibrate both\r\n");
 
   /* USER CODE END 2 */
 
@@ -270,56 +316,50 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      float weight_lb;
+      float w1, w2;
       uint8_t command;
+      bool ok1 = HX711_GetWeight(&loadcell1, &w1);
+      bool ok2 = HX711_GetWeight(&loadcell2, &w2);
 
-      // Read weight directly in pounds.
-      if (HX711_GetWeight(&loadcell, &weight_lb))
+      if (ok1) weight1_lb = w1;
+      if (ok2) weight2_lb = w2;
+
+      if (ok1 && ok2)
       {
-          measured_weight_lb = weight_lb;
-
-          // Display the live measurement.
-          Serial_PrintWeight(measured_weight_lb);
+          snprintf(uart_buffer, sizeof(uart_buffer),
+                   "Axial: %.3f lb | Horizontal: %.3f lb\r\n",
+                   (double)weight1_lb, (double)weight2_lb);
+          Serial_Print(uart_buffer);
       }
       else
       {
-          Serial_Print("ERROR: HX711 read timeout!\r\n");
+          Serial_Print("HX711 read timeout: check sensor wiring.\r\n");
       }
 
-      // Check for serial commands.
-      if (HAL_UART_Receive(&huart2,
-                           &command, 1, 20) == HAL_OK)
+      if (HAL_UART_Receive(&huart2, &command, 1, 20) == HAL_OK)
       {
           if (command == 't')
           {
-              Serial_Print("\r\nTaring...\r\n");
-
-              if (HX711_Tare(&loadcell))
-              {
-                  Serial_Print("Tare complete!\r\n");
-              }
-              else
-              {
-                  Serial_Print("ERROR: Tare failed!\r\n");
-              }
+              Serial_Print("Taring both sensors; remove external loads.\r\n");
+              bool t1 = HX711_Tare(&loadcell1);
+              bool t2 = HX711_Tare(&loadcell2);
+              Serial_Print(t1 && t2 ? "Both sensors tared.\r\n"
+                                    : "Tare failed for at least one sensor.\r\n");
           }
           else if (command == 'r')
           {
-              Serial_Print("\r\nStarting recalibration...\r\n");
-
-              if (!Calibrate_LoadCell())
-              {
-                  Serial_Print("ERROR: Recalibration failed!\r\n");
-              }
+              Serial_Print("Recalibrating both sensors.\r\n");
+              while (!Calibrate_LoadCell(&loadcell1, "Axial load cell"))
+                  Serial_Print("Axial calibration failed. Retry.\r\n");
+              while (!Calibrate_LoadCell(&loadcell2, "Horizontal load cell"))
+                  Serial_Print("Horizontal calibration failed. Retry.\r\n");
+              Serial_Print("Both sensors calibrated.\r\n");
           }
       }
 
       HAL_Delay(500);
-
-
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
+      /* USER CODE END WHILE */
+      /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
@@ -466,9 +506,13 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : PA0 */
   GPIO_InitStruct.Pin = GPIO_PIN_0;
@@ -482,6 +526,19 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB1 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */

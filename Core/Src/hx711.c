@@ -12,11 +12,7 @@
 // TIM2 is defined in main.c
 extern TIM_HandleTypeDef htim2;
 
-#define HX_DOUT_PORT GPIOA
-#define HX_DOUT_PIN  GPIO_PIN_0
 
-#define HX_SCK_PORT  GPIOA
-#define HX_SCK_PIN   GPIO_PIN_1
 
 #define HX_TIMEOUT_MS 500
 
@@ -32,16 +28,16 @@ static void delay_us(uint16_t us)
 // Read one signed 24-bit HX711 measurement.
 // Channel A, gain 128.
 // Returns false if no data arrives before timeout.
-bool HX711_ReadRaw(int32_t *value)
+bool HX711_ReadRaw(HX711_t *hx, int32_t *value)
 {
-    if (value == NULL)
+    if (hx == NULL || value == NULL)
         return false;
 
     uint32_t start = HAL_GetTick();
 
     // Wait for DOUT to go LOW.
-    while (HAL_GPIO_ReadPin(HX_DOUT_PORT,
-                             HX_DOUT_PIN) == GPIO_PIN_SET)
+    while (HAL_GPIO_ReadPin(hx->dout_port,
+                             hx->dout_pin) == GPIO_PIN_SET)
     {
         if ((HAL_GetTick() - start) >= HX_TIMEOUT_MS)
             return false;
@@ -55,22 +51,22 @@ bool HX711_ReadRaw(int32_t *value)
 
     for (uint8_t i = 0; i < 24; i++)
     {
-        HAL_GPIO_WritePin(HX_SCK_PORT,
-                          HX_SCK_PIN,
+        HAL_GPIO_WritePin(hx->sck_port,
+                          hx->sck_pin,
                           GPIO_PIN_SET);
 
         delay_us(2);
 
         data <<= 1;
 
-        if (HAL_GPIO_ReadPin(HX_DOUT_PORT,
-                             HX_DOUT_PIN) == GPIO_PIN_SET)
+        if (HAL_GPIO_ReadPin(hx->dout_port,
+                             hx->dout_pin) == GPIO_PIN_SET)
         {
             data |= 1;
         }
 
-        HAL_GPIO_WritePin(HX_SCK_PORT,
-                          HX_SCK_PIN,
+        HAL_GPIO_WritePin(hx->sck_port,
+                          hx->sck_pin,
                           GPIO_PIN_RESET);
 
         delay_us(2);
@@ -78,14 +74,14 @@ bool HX711_ReadRaw(int32_t *value)
 
     // Pulse 25 selects Channel A, gain 128
     // for the next conversion.
-    HAL_GPIO_WritePin(HX_SCK_PORT,
-                      HX_SCK_PIN,
+    HAL_GPIO_WritePin(hx->sck_port,
+                      hx->sck_pin,
                       GPIO_PIN_SET);
 
     delay_us(2);
 
-    HAL_GPIO_WritePin(HX_SCK_PORT,
-                      HX_SCK_PIN,
+    HAL_GPIO_WritePin(hx->sck_port,
+                      hx->sck_pin,
                       GPIO_PIN_RESET);
 
     delay_us(2);
@@ -102,9 +98,9 @@ bool HX711_ReadRaw(int32_t *value)
 }
 
 // Average multiple successful measurements.
-bool HX711_ReadAverage(uint8_t samples, int32_t *average)
+bool HX711_ReadAverage(HX711_t *hx, uint8_t samples, int32_t *average)
 {
-    if (samples == 0 || average == NULL)
+    if (hx == NULL || samples == 0 || average == NULL)
         return false;
 
     int64_t sum = 0;
@@ -112,8 +108,8 @@ bool HX711_ReadAverage(uint8_t samples, int32_t *average)
 
     for (uint8_t i = 0; i < samples; i++)
     {
-        if (!HX711_ReadRaw(&raw))
-            return false;
+    	if (!HX711_ReadRaw(hx, &raw))
+    	    return false;
 
         sum += raw;
     }
@@ -128,7 +124,7 @@ bool HX711_Tare(HX711_t *hx)
     if (hx == NULL)
         return false;
 
-    return HX711_ReadAverage(20, &hx->offset);
+    return HX711_ReadAverage(hx, 20, &hx->offset);
 }
 
 // Calibrate with a known applied force in lbs.
@@ -140,7 +136,7 @@ bool HX711_Calibrate(HX711_t *hx, float known_weight_lb)
 
     int32_t reading;
 
-    if (!HX711_ReadAverage(20, &reading))
+    if (!HX711_ReadAverage(hx, 20, &reading))
         return false;
 
     float new_scale =
@@ -163,7 +159,7 @@ bool HX711_GetWeight(HX711_t *hx, float *weight_lb)
 
     int32_t reading;
 
-    if (!HX711_ReadRaw(&reading))
+    if (!HX711_ReadRaw(hx, &reading))
         return false;
 
     *weight_lb =
