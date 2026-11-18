@@ -33,6 +33,7 @@ bool HX711_ReadAverage(HX711_t *hx, uint8_t samples, int32_t *average);
 bool HX711_Tare(HX711_t *hx);
 bool HX711_Calibrate(HX711_t *hx, float known_weight_lb);
 bool HX711_GetWeight(HX711_t *hx, float *weight_lb);
+bool HX711_TryGetWeight(HX711_t *hx, float *weight_lb);
 
 #endif
 

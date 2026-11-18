@@ -45,7 +45,10 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+CAN_HandleTypeDef hcan1;
+
 TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim6;
 
 UART_HandleTypeDef huart2;
 
@@ -71,7 +74,16 @@ HX711_t loadcell2 = {
 volatile float weight1_lb = 0.0f;
 volatile float weight2_lb = 0.0f;
 
-char uart_buffer[100];
+/* Latest successful samples; TIM6 ISR writes, main loop reads. */
+volatile uint32_t axial_timestamp_ms = 0;
+volatile uint32_t horizontal_timestamp_ms = 0;
+volatile uint32_t axial_sample_count = 0;
+volatile uint32_t horizontal_sample_count = 0;
+volatile uint8_t axial_valid = 0;
+volatile uint8_t horizontal_valid = 0;
+volatile uint32_t control_cycle_count = 0;
+
+char uart_buffer[160];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -79,6 +91,8 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_CAN1_Init(void);
+static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -253,6 +267,7 @@ static bool Calibrate_LoadCell(HX711_t *hx, const char *name)
 }
 
 
+
 /* USER CODE END 0 */
 
 /**
@@ -286,6 +301,8 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM2_Init();
   MX_USART2_UART_Init();
+  MX_CAN1_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
   if (HAL_TIM_Base_Start(&htim2) != HAL_OK)
   {
@@ -293,72 +310,88 @@ int main(void)
   }
 
   HAL_Delay(2000);
+  Serial_Print("\r\nSTM32 DUAL HX711 - TIM6 ACQUISITION\r\n");
+  Serial_Print("Axial: offset 13229, scale 25848.474609 counts/lb\r\n");
+  Serial_Print("Horizontal: offset 585800, scale 97598.601562 counts/lb\r\n");
+  Serial_Print("TIM6 checks both HX711 DOUT pins every 3 ms.\r\n");
+  Serial_Print("PA5 toggles on each TIM6 interrupt (scope: 6 ms period).\r\n");
+  Serial_Print("Commands: t = tare both, r = recalibrate horizontal (Enter).\r\n");
 
-  Serial_Print("\r\nSTM32 DUAL HX711 SYSTEM STARTED\r\n");
-
-  // Axial load cell uses hardcoded calibration.
-  Serial_Print("\r\nAxial load cell calibration loaded.\r\n");
-  Serial_Print("Offset: 13229 counts\r\n");
-  Serial_Print("Scale: 25848.474609 counts/lb\r\n");
-
-  // Horizontal load cell also uses hardcoded calibration.
-  Serial_Print("\r\nHorizontal load cell calibration loaded.\r\n");
-  Serial_Print("Offset: 585800 counts\r\n");
-  Serial_Print("Scale: 97598.601562 counts/lb\r\n");
-
-  Serial_Print("\r\nBoth load cells ready for measurements!\r\n");
-  Serial_Print("Commands (send one character): t = tare both, r = recalibrate horizontal\r\n");
-
+  if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
+  {
+      Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint32_t last_print_ms = HAL_GetTick();
   while (1)
   {
-      float w1, w2;
-      uint8_t command;
-      bool ok1 = HX711_GetWeight(&loadcell1, &w1);
-      bool ok2 = HX711_GetWeight(&loadcell2, &w2);
-
-      if (ok1) weight1_lb = w1;
-      if (ok2) weight2_lb = w2;
-
-      if (ok1 && ok2)
+      uint32_t now = HAL_GetTick();
+      /* Display only twice per second. TIM6 sensor acquisition is unchanged. */
+      if ((uint32_t)(now - last_print_ms) >= 500U)
       {
-          snprintf(uart_buffer, sizeof(uart_buffer),
-                   "Axial: %.3f lb | Horizontal: %.3f lb\r\n",
-                   (double)weight1_lb, (double)weight2_lb);
+          last_print_ms = now;
+
+          float axial_lb = weight1_lb;
+          float horizontal_lb = weight2_lb;
+          uint32_t axial_age = now - axial_timestamp_ms;
+          uint32_t horizontal_age = now - horizontal_timestamp_ms;
+
+          /* Keep sensor failure visible without flooding the terminal. */
+          if (!axial_valid || !horizontal_valid ||
+              axial_age > 250U || horizontal_age > 250U)
+          {
+              snprintf(uart_buffer, sizeof(uart_buffer),
+                       "Axial: %s | Horizontal: %s\r\n",
+                       !axial_valid ? "NO DATA" : (axial_age > 250U ? "STALE" : "OK"),
+                       !horizontal_valid ? "NO DATA" : (horizontal_age > 250U ? "STALE" : "OK"));
+          }
+          else
+          {
+              snprintf(uart_buffer, sizeof(uart_buffer),
+                       "Axial: %.3f lb | Horizontal: %.3f lb\r\n",
+                       (double)axial_lb, (double)horizontal_lb);
+          }
           Serial_Print(uart_buffer);
       }
-      else
-      {
-          Serial_Print("HX711 read timeout: check sensor wiring.\r\n");
-      }
 
-      if (HAL_UART_Receive(&huart2, &command, 1, 20) == HAL_OK)
+      /* UART is serviced only in foreground, never from an ISR. */
+      uint8_t command;
+      if (HAL_UART_Receive(&huart2, &command, 1, 1) == HAL_OK)
       {
-          if (command == 't')
+          if (command == 't' || command == 'r')
           {
-              Serial_Print("Taring both sensors; remove external loads.\r\n");
-              bool t1 = HX711_Tare(&loadcell1);
-              bool t2 = HX711_Tare(&loadcell2);
-              Serial_Print(t1 && t2 ? "Both sensors tared.\r\n"
-                                    : "Tare failed for at least one sensor.\r\n");
-          }
-          else if (command == 'r')
-          {
-              Serial_Print("\r\nRecalibrating horizontal load cell...\r\n");
+              /* Prevent TIM6 from reading the ADCs during a blocking calibration. */
+              if (HAL_TIM_Base_Stop_IT(&htim6) != HAL_OK)
+                  Error_Handler();
 
-              if (!Calibrate_LoadCell(&loadcell2, "Horizontal load cell"))
+              if (command == 't')
               {
-                  Serial_Print("ERROR: Recalibration failed!\r\n");
+                  Serial_Print("\r\nRemove all external loads. Taring both...\r\n");
+                  bool ok1 = HX711_Tare(&loadcell1);
+                  bool ok2 = HX711_Tare(&loadcell2);
+                  Serial_Print((ok1 && ok2) ? "Tare complete.\r\n" : "Tare FAILED.\r\n");
               }
+              else
+              {
+                  Serial_Print("\r\nHorizontal load cell recalibration\r\n");
+                  if (!Calibrate_LoadCell(&loadcell2, "Horizontal load cell"))
+                      Serial_Print("Calibration FAILED.\r\n");
+              }
+
+              /* Offsets may have changed. Discard previously cached readings. */
+              axial_valid = 0;
+              horizontal_valid = 0;
+              if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
+                  Error_Handler();
           }
       }
+      /* No HAL_Delay(500): sampling occurs in the TIM6 ISR. */
+    /* USER CODE END WHILE */
 
-      HAL_Delay(500);
-      /* USER CODE END WHILE */
-      /* USER CODE BEGIN 3 */
+    /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
@@ -413,6 +446,43 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief CAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN1_Init(void)
+{
+
+  /* USER CODE BEGIN CAN1_Init 0 */
+
+  /* USER CODE END CAN1_Init 0 */
+
+  /* USER CODE BEGIN CAN1_Init 1 */
+
+  /* USER CODE END CAN1_Init 1 */
+  hcan1.Instance = CAN1;
+  hcan1.Init.Prescaler = 5;
+  hcan1.Init.Mode = CAN_MODE_NORMAL;
+  hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_13TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
+  hcan1.Init.TimeTriggeredMode = DISABLE;
+  hcan1.Init.AutoBusOff = ENABLE;
+  hcan1.Init.AutoWakeUp = DISABLE;
+  hcan1.Init.AutoRetransmission = ENABLE;
+  hcan1.Init.ReceiveFifoLocked = DISABLE;
+  hcan1.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CAN1_Init 2 */
+
+  /* USER CODE END CAN1_Init 2 */
+
+}
+
+/**
   * @brief TIM2 Initialization Function
   * @param None
   * @retval None
@@ -454,6 +524,44 @@ static void MX_TIM2_Init(void)
   /* USER CODE BEGIN TIM2_Init 2 */
 
   /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 79;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 2999;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
 
 }
 
@@ -508,7 +616,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1|GPIO_PIN_5, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
@@ -519,8 +627,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PA1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  /*Configure GPIO pins : PA1 PA5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_5;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -544,7 +652,43 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* Timer ISR: no waiting for HX711 DOUT, no serial calls, no CAN code.
+ * HX711_GetWeight() is safe here only after DOUT is LOW, because its
+ * normal up-to-500ms ready wait is then skipped. Each read still
+ * disables interrupts during the 25 SCK pulses; scope-check jitter.
+ * The HX711 conversion rate (10 or 80 SPS) limits actual new samples.
+ */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance != TIM6)
+        return;
 
+    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); /* D13 / LD2: 3ms toggle interval */
+    control_cycle_count++;
+
+    float reading;
+    if (HAL_GPIO_ReadPin(loadcell1.dout_port, loadcell1.dout_pin) == GPIO_PIN_RESET)
+    {
+        if (HX711_GetWeight(&loadcell1, &reading))
+        {
+            weight1_lb = reading;
+            axial_timestamp_ms = HAL_GetTick();
+            axial_sample_count++;
+            axial_valid = 1;
+        }
+    }
+
+    if (HAL_GPIO_ReadPin(loadcell2.dout_port, loadcell2.dout_pin) == GPIO_PIN_RESET)
+    {
+        if (HX711_GetWeight(&loadcell2, &reading))
+        {
+            weight2_lb = reading;
+            horizontal_timestamp_ms = HAL_GetTick();
+            horizontal_sample_count++;
+            horizontal_valid = 1;
+        }
+    }
+}
 /* USER CODE END 4 */
 
 /**

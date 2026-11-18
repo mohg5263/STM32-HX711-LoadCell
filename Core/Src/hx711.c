@@ -169,3 +169,32 @@ bool HX711_GetWeight(HX711_t *hx, float *weight_lb)
     return true;
 }
 
+
+bool HX711_TryGetWeight(
+    HX711_t *hx,
+    float *weight_lb)
+{
+    if (hx == NULL || weight_lb == NULL ||
+        hx->scale == 0.0f)
+        return false;
+
+    // No fresh conversion available.
+    if (HAL_GPIO_ReadPin(
+            hx->dout_port,
+            hx->dout_pin) == GPIO_PIN_SET)
+    {
+        return false;
+    }
+
+    int32_t raw;
+
+    // Requires a bounded raw-read implementation.
+    if (!HX711_TryReadRaw(hx, &raw))
+        return false;
+
+    *weight_lb =
+        ((float)raw - (float)hx->offset) /
+        hx->scale;
+
+    return true;
+}
