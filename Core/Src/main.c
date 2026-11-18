@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 
 #include "hx711.h"
+#include "cubemars.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,8 +83,14 @@ volatile uint32_t horizontal_sample_count = 0;
 volatile uint8_t axial_valid = 0;
 volatile uint8_t horizontal_valid = 0;
 volatile uint32_t control_cycle_count = 0;
+/* Diagnostic test: automatically queue DISABLE after 1500 ms. */
+static uint8_t enable_test_active = 0U;
+static uint32_t enable_test_start_ms = 0U;
+static uint32_t enable_test_first_frames = 0U;
+/* Lock out further enabling if the automatic disable could not be queued. */
+static uint8_t enable_test_disable_fault = 0U;
 
-char uart_buffer[160];
+char uart_buffer[200];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -315,7 +322,32 @@ int main(void)
   Serial_Print("Horizontal: offset 585800, scale 97598.601562 counts/lb\r\n");
   Serial_Print("TIM6 checks both HX711 DOUT pins every 3 ms.\r\n");
   Serial_Print("PA5 toggles on each TIM6 interrupt (scope: 6 ms period).\r\n");
-  Serial_Print("Commands: t = tare both, r = recalibrate horizontal (Enter).\r\n");
+  Serial_Print("Commands: e = 1.5s enable test, d = disable, t = tare, r = recalibrate.\r\n");
+
+  /* Accept CAN frames for diagnostic purposes, decode only motor ID 9.
+   * No transmission is made at startup. */
+  CAN_FilterTypeDef can_filter = {0};
+  can_filter.FilterBank = 0;
+  can_filter.FilterMode = CAN_FILTERMODE_IDMASK;
+  can_filter.FilterScale = CAN_FILTERSCALE_32BIT;
+  can_filter.FilterIdHigh = 0;
+  can_filter.FilterIdLow = 0;
+  can_filter.FilterMaskIdHigh = 0;
+  can_filter.FilterMaskIdLow = 0;
+  can_filter.FilterFIFOAssignment = CAN_RX_FIFO0;
+  can_filter.FilterActivation = CAN_FILTER_ENABLE;
+  can_filter.SlaveStartFilterBank = 14;
+
+  if (HAL_CAN_ConfigFilter(&hcan1, &can_filter) != HAL_OK)
+      Error_Handler();
+  if (HAL_CAN_Start(&hcan1) != HAL_OK)
+      Error_Handler();
+  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
+      Error_Handler();
+  Serial_Print("CAN1 listening at 1 Mbps for MIT feedback from motor ID 9.\r\n");
+  Serial_Print("Motor starts DISABLED. Explicit e sends MIT ENABLE for 1.5 seconds.\r\n");
+  Serial_Print("No position, torque, zero or velocity commands are sent.\r\n");
+  Serial_Print("IMPORTANT: MIT enable can activate torque; use an unloaded shaft and physical cutoff.\r\n");
 
   if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
   {
@@ -329,40 +361,121 @@ int main(void)
   while (1)
   {
       uint32_t now = HAL_GetTick();
-      /* Display only twice per second. TIM6 sensor acquisition is unchanged. */
-      if ((uint32_t)(now - last_print_ms) >= 500U)
+      /* Test window ends after 1.5 s even if no feedback is received.
+       * Retry nonblocking DISABLE while mailbox is temporarily unavailable.
+       * A queued CAN message is NOT a safety-rated stop; power cutoff must remain accessible. */
+      if (enable_test_active &&
+          (uint32_t)(now - enable_test_start_ms) >= 1500U)
       {
-          last_print_ms = now;
-
-          float axial_lb = weight1_lb;
-          float horizontal_lb = weight2_lb;
-          uint32_t axial_age = now - axial_timestamp_ms;
-          uint32_t horizontal_age = now - horizontal_timestamp_ms;
-
-          /* Keep sensor failure visible without flooding the terminal. */
-          if (!axial_valid || !horizontal_valid ||
-              axial_age > 250U || horizontal_age > 250U)
+          if (CubeMars_DisableOnce(&hcan1))
           {
+              enable_test_active = 0U;
+              CubeMars_Feedback_t snap;
+              CubeMars_GetFeedback(&snap);
               snprintf(uart_buffer, sizeof(uart_buffer),
-                       "Axial: %s | Horizontal: %s\r\n",
-                       !axial_valid ? "NO DATA" : (axial_age > 250U ? "STALE" : "OK"),
-                       !horizontal_valid ? "NO DATA" : (horizontal_age > 250U ? "STALE" : "OK"));
+                       "MIT DISABLE queued. CAN RX during test: %lu frames.\r\n",
+                       (unsigned long)(snap.all_frames - enable_test_first_frames));
+              Serial_Print(uart_buffer);
           }
           else
           {
-              snprintf(uart_buffer, sizeof(uart_buffer),
-                       "Axial: %.3f lb | Horizontal: %.3f lb\r\n",
-                       (double)axial_lb, (double)horizontal_lb);
+              /* Continue trying; no CAN command delivery can be guaranteed. */
+              enable_test_disable_fault = 1U;
           }
-          Serial_Print(uart_buffer);
+      }
+       /* Display only twice per second. TIM6 acquisition continues unchanged. */
+       if ((uint32_t)(now - last_print_ms) >= 500U)
+       {
+           last_print_ms = now;
+
+           float axial_lb = weight1_lb;
+           float horizontal_lb = weight2_lb;
+           uint32_t axial_age = now - axial_timestamp_ms;
+           uint32_t horizontal_age = now - horizontal_timestamp_ms;
+           CubeMars_Feedback_t m;
+           CubeMars_GetFeedback(&m);
+
+           const char *a_state = !axial_valid ? "NO DATA" :
+               (axial_age > 250U ? "STALE" : "OK");
+           const char *h_state = !horizontal_valid ? "NO DATA" :
+               (horizontal_age > 250U ? "STALE" : "OK");
+
+           /* Feedback display never sends motor commands. */
+           if (m.feedback_valid && (uint32_t)(now - m.last_rx_ms) <= 1000U)
+           {
+               snprintf(uart_buffer, sizeof(uart_buffer),
+                        "Axial %.3f lb [%s] | Horizontal %.3f lb [%s] | Motor 9: %.3f rad, %.2f rad/s, %.2f Nm [RX #%lu]\r\n",
+                        (double)axial_lb, a_state,
+                        (double)horizontal_lb, h_state,
+                        (double)m.position_rad, (double)m.velocity_rad_s,
+                        (double)m.torque_nm, (unsigned long)m.matching_frames);
+           }
+           else
+           {
+               snprintf(uart_buffer, sizeof(uart_buffer),
+                        "Axial %.3f lb [%s] | Horizontal %.3f lb [%s] | Motor 9: %s (CAN all=%lu, match=%lu, other=%lu, bad=%lu)\r\n",
+                        (double)axial_lb, a_state,
+                        (double)horizontal_lb, h_state,
+                        m.feedback_valid ? "STALE" : "NO FEEDBACK",
+                        (unsigned long)m.all_frames,
+                        (unsigned long)m.matching_frames,
+                        (unsigned long)m.other_frames,
+                        (unsigned long)m.invalid_frames);
+           }
+           Serial_Print(uart_buffer);
       }
 
       /* UART is serviced only in foreground, never from an ISR. */
       uint8_t command;
       if (HAL_UART_Receive(&huart2, &command, 1, 1) == HAL_OK)
       {
-          if (command == 't' || command == 'r')
+          if (command == 'e')
           {
+              if (enable_test_active)
+              {
+                  Serial_Print("Enable test already active.\r\n");
+              }
+              else if (enable_test_disable_fault)
+              {
+                  Serial_Print("ENABLE LOCKED OUT: disable failed previously. Remove motor power and reset MCU.\r\n");
+              }
+              else
+              {
+                  CubeMars_Feedback_t snap;
+                  CubeMars_GetFeedback(&snap);
+                  enable_test_first_frames = snap.all_frames;
+                  if (CubeMars_EnableOnce(&hcan1))
+                  {
+                      enable_test_active = 1U;
+                      enable_test_start_ms = HAL_GetTick();
+                      Serial_Print("MIT ENABLE queued for motor 9; DISABLE automatically queued after 1.5 s.\r\n");
+                  }
+                  else
+                  {
+                      Serial_Print("MIT ENABLE NOT queued (CAN mailbox / error).\r\n");
+                  }
+              }
+          }
+          else if (command == 'd')
+          {
+              if (CubeMars_DisableOnce(&hcan1))
+              {
+                  enable_test_active = 0U;
+                  Serial_Print("MIT DISABLE queued.\r\n");
+              }
+              else
+              {
+                  enable_test_disable_fault = 1U;
+                  Serial_Print("MIT DISABLE could not be queued! CUT MOTOR POWER if unsafe.\r\n");
+              }
+          }
+          else if (command == 't' || command == 'r')
+          {
+              if (enable_test_active)
+              {
+                  Serial_Print("Calibration blocked while enable test is active.\r\n");
+                  continue;
+              }
               /* Prevent TIM6 from reading the ADCs during a blocking calibration. */
               if (HAL_TIM_Base_Stop_IT(&htim6) != HAL_OK)
                   Error_Handler();
@@ -689,6 +802,21 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         }
     }
 }
+/* Interrupt-driven receive: drain hardware FIFO; never block or print here. */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    if (hcan->Instance != CAN1) return;
+    CAN_RxHeaderTypeDef header;
+    uint8_t data[8];
+    /* Hardware FIFO holds at most three frames. */
+    while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) > 0U)
+    {
+        if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &header, data) != HAL_OK)
+            break;
+        CubeMars_ProcessRx(&header, data);
+    }
+}
+
 /* USER CODE END 4 */
 
 /**
