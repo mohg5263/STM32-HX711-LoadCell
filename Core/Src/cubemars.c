@@ -112,3 +112,50 @@ uint8_t CubeMars_DisableOnce(CAN_HandleTypeDef *hcan)
 {
     return CubeMars_SendSpecial(hcan, 0xFDU);
 }
+
+/* Reference: user's working eight-actuator legacy MIT protocol:
+ * p16 | v12 | kp12 | kd12 | torque12, motor CAN standard ID = 9.
+ * This command requests ZERO kp, kd, velocity and feedforward torque.
+ * Position field is set to the center of the allowed encoding, but with
+ * KP=0 it does not command a position-holding torque.
+ * All fields within 0..(2^bits-1). Do not transmit from an interrupt.
+ */
+static uint16_t CubeMars_Encode(float val, float low, float high, uint32_t mask)
+{
+    if (val < low) val = low;
+    if (val > high) val = high;
+    float f = (val - low) * (float)mask / (high - low);
+    uint32_t enc = (uint32_t)(f + 0.5f);
+    if (enc > mask) enc = mask;
+    return (uint16_t)enc;
+}
+
+uint8_t CubeMars_SendPassiveMIT(CAN_HandleTypeDef *hcan)
+{
+    if (hcan == NULL || HAL_CAN_GetTxMailboxesFreeLevel(hcan) == 0U)
+        return 0U;
+
+    uint16_t p = CubeMars_Encode(0.0f, AK40_P_MIN, AK40_P_MAX, 65535U);
+    uint16_t v = CubeMars_Encode(0.0f, AK40_V_MIN, AK40_V_MAX, 4095U);
+    uint16_t t = CubeMars_Encode(0.0f, AK40_T_MIN, AK40_T_MAX, 4095U);
+    uint16_t kp = 0U, kd = 0U;
+
+    uint8_t data[8] = {
+        (uint8_t)(p >> 8),
+        (uint8_t)(p & 0xFFU),
+        (uint8_t)(v >> 4),
+        (uint8_t)(((v & 0xFU) << 4) | (kp >> 8)),
+        (uint8_t)(kp & 0xFFU),
+        (uint8_t)(kd >> 4),
+        (uint8_t)(((kd & 0xFU) << 4) | (t >> 8)),
+        (uint8_t)(t & 0xFFU)
+    };
+    CAN_TxHeaderTypeDef header = {0};
+    uint32_t mailbox = 0;
+    header.StdId = MOTOR_CAN_ID;
+    header.IDE = CAN_ID_STD;
+    header.RTR = CAN_RTR_DATA;
+    header.DLC = 8U;
+    header.TransmitGlobalTime = DISABLE;
+    return (HAL_CAN_AddTxMessage(hcan, &header, data, &mailbox) == HAL_OK) ? 1U : 0U;
+}

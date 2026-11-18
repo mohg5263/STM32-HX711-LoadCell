@@ -24,9 +24,13 @@ typedef struct {
     uint8_t feedback_valid;
 } CubeMars_Feedback_t;
 
-/* Non-blocking one-shot legacy MIT special commands for CAN ID 9. */
+/* Non-blocking legacy MIT commands for CAN ID 9. */
 uint8_t CubeMars_EnableOnce(CAN_HandleTypeDef *hcan);
 uint8_t CubeMars_DisableOnce(CAN_HandleTypeDef *hcan);
+/* Zero-gain, zero-velocity and zero-feedforward command, 50 Hz monitor only.
+ * Note: CAN field quantization means encoded zero torque has small rounding error.
+ * The drive remains electrically enabled, so this is NOT a safety stop. */
+uint8_t CubeMars_SendPassiveMIT(CAN_HandleTypeDef *hcan);
 
 /* Called in CAN RX interrupt; does not transmit. */
 void CubeMars_ProcessRx(const CAN_RxHeaderTypeDef *header, const uint8_t data[8]);

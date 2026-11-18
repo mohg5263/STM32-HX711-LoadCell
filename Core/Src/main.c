@@ -83,12 +83,24 @@ volatile uint32_t horizontal_sample_count = 0;
 volatile uint8_t axial_valid = 0;
 volatile uint8_t horizontal_valid = 0;
 volatile uint32_t control_cycle_count = 0;
-/* Diagnostic test: automatically queue DISABLE after 1500 ms. */
-static uint8_t enable_test_active = 0U;
-static uint32_t enable_test_start_ms = 0U;
-static uint32_t enable_test_first_frames = 0U;
-/* Lock out further enabling if the automatic disable could not be queued. */
-static uint8_t enable_test_disable_fault = 0U;
+/* 50-Hz MIT position-monitoring trial. Never enable automatically.
+ * Send zero-gain/zero-feedforward frames for up to 10 seconds.
+ * Software-only timeout and disable are NOT an emergency stop. */
+#define MONITOR_TX_PERIOD_MS      20U
+#define MONITOR_MAX_DURATION_MS  60000U
+#define MONITOR_START_GRACE_MS   700U
+#define MONITOR_FEEDBACK_MAX_AGE_MS 400U
+
+static uint8_t monitor_active = 0U;
+static uint8_t monitor_stopping = 0U;
+static uint8_t monitor_lockout = 0U;
+static uint8_t monitor_fault_stop = 0U;
+static uint32_t monitor_start_ms = 0U;
+static uint32_t monitor_last_tx_ms = 0U;
+static uint32_t monitor_initial_rx = 0U;
+static uint32_t monitor_tx_frames = 0U;
+static uint32_t monitor_tx_failures = 0U;
+static uint32_t monitor_last_disable_attempt_ms = 0U;
 
 char uart_buffer[200];
 /* USER CODE END PV */
@@ -322,7 +334,7 @@ int main(void)
   Serial_Print("Horizontal: offset 585800, scale 97598.601562 counts/lb\r\n");
   Serial_Print("TIM6 checks both HX711 DOUT pins every 3 ms.\r\n");
   Serial_Print("PA5 toggles on each TIM6 interrupt (scope: 6 ms period).\r\n");
-  Serial_Print("Commands: e = 1.5s enable test, d = disable, t = tare, r = recalibrate.\r\n");
+  Serial_Print("Commands: e = 10s position monitor (50 Hz), d = disable, t = tare, r = recalibrate.\r\n");
 
   /* Accept CAN frames for diagnostic purposes, decode only motor ID 9.
    * No transmission is made at startup. */
@@ -345,9 +357,9 @@ int main(void)
   if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
       Error_Handler();
   Serial_Print("CAN1 listening at 1 Mbps for MIT feedback from motor ID 9.\r\n");
-  Serial_Print("Motor starts DISABLED. Explicit e sends MIT ENABLE for 1.5 seconds.\r\n");
-  Serial_Print("No position, torque, zero or velocity commands are sent.\r\n");
-  Serial_Print("IMPORTANT: MIT enable can activate torque; use an unloaded shaft and physical cutoff.\r\n");
+  Serial_Print("Motor starts DISABLED. Explicit e starts a MAX 10s, 50 Hz MIT monitor.\r\n");
+  Serial_Print("Monitor sends p=0, v=0, Kp=0, Kd=0, t=0 (quantized). No zero-origin command.\r\n");
+  Serial_Print("IMPORTANT: Motor is ENABLED during test; use free shaft and PHYSICAL POWER CUTOFF.\r\n");
 
   if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
   {
@@ -361,28 +373,77 @@ int main(void)
   while (1)
   {
       uint32_t now = HAL_GetTick();
-      /* Test window ends after 1.5 s even if no feedback is received.
-       * Retry nonblocking DISABLE while mailbox is temporarily unavailable.
-       * A queued CAN message is NOT a safety-rated stop; power cutoff must remain accessible. */
-      if (enable_test_active &&
-          (uint32_t)(now - enable_test_start_ms) >= 1500U)
+      /* Foreground-only transmit scheduler: 50 Hz, not tied to TIM6 ISR.
+       * TIM6 continues HX711 acquisition every 3 ms. */
+      if (monitor_active && !monitor_stopping)
       {
+          CubeMars_Feedback_t status;
+          CubeMars_GetFeedback(&status);
+          uint32_t age = (uint32_t)(now - monitor_start_ms);
+          uint8_t got_new_feedback = (status.matching_frames != monitor_initial_rx);
+
+          if (age >= MONITOR_MAX_DURATION_MS)
+          {
+              monitor_stopping = 1U;
+              Serial_Print("Monitor timeout (10s). Requesting motor DISABLE.\r\n");
+          }
+          else if (age >= MONITOR_START_GRACE_MS &&
+                   (!got_new_feedback ||
+                    (uint32_t)(now - status.last_rx_ms) > MONITOR_FEEDBACK_MAX_AGE_MS))
+          {
+              monitor_stopping = 1U;
+              monitor_fault_stop = 1U;
+              monitor_lockout = 1U;
+              Serial_Print("FAULT: MIT feedback missing/stale. Requesting DISABLE.\r\n");
+          }
+          else if ((hcan1.Instance->ESR & CAN_ESR_BOFF) != 0U)
+          {
+              monitor_stopping = 1U;
+              monitor_fault_stop = 1U;
+              monitor_lockout = 1U;
+              Serial_Print("FAULT: CAN bus-off. Requesting DISABLE. CHECK POWER CUTOFF.\r\n");
+          }
+          else if ((uint32_t)(now - monitor_last_tx_ms) >= MONITOR_TX_PERIOD_MS)
+          {
+              monitor_last_tx_ms = now;
+              if (CubeMars_SendPassiveMIT(&hcan1))
+              {
+                  monitor_tx_frames++;
+              }
+              else
+              {
+                  monitor_tx_failures++;
+                  monitor_stopping = 1U;
+                  monitor_fault_stop = 1U;
+                  monitor_lockout = 1U;
+                  Serial_Print("FAULT: MIT CAN transmit not queued. Requesting DISABLE.\r\n");
+              }
+          }
+      }
+
+      /* Stop requests: retry non-blocking disable every 10 ms, lock out
+       * re-enable if a fault occurred or disabling cannot be queued. */
+      if (monitor_stopping &&
+          (uint32_t)(now - monitor_last_disable_attempt_ms) >= 10U)
+      {
+          monitor_last_disable_attempt_ms = now;
           if (CubeMars_DisableOnce(&hcan1))
           {
-              enable_test_active = 0U;
-              CubeMars_Feedback_t snap;
-              CubeMars_GetFeedback(&snap);
+              monitor_active = 0U;
+              monitor_stopping = 0U;
               snprintf(uart_buffer, sizeof(uart_buffer),
-                       "MIT DISABLE queued. CAN RX during test: %lu frames.\r\n",
-                       (unsigned long)(snap.all_frames - enable_test_first_frames));
+                  "MIT DISABLE queued. Monitor TX=%lu, failures=%lu, fault=%u.\r\n",
+                  (unsigned long)monitor_tx_frames,
+                  (unsigned long)monitor_tx_failures,
+                  (unsigned)monitor_fault_stop);
               Serial_Print(uart_buffer);
           }
           else
           {
-              /* Continue trying; no CAN command delivery can be guaranteed. */
-              enable_test_disable_fault = 1U;
+              monitor_lockout = 1U;
           }
       }
+
        /* Display only twice per second. TIM6 acquisition continues unchanged. */
        if ((uint32_t)(now - last_print_ms) >= 500U)
        {
@@ -431,49 +492,48 @@ int main(void)
       {
           if (command == 'e')
           {
-              if (enable_test_active)
+              if (monitor_active || monitor_stopping)
               {
-                  Serial_Print("Enable test already active.\r\n");
+                  Serial_Print("Monitor already enabled or stopping.\r\n");
               }
-              else if (enable_test_disable_fault)
+              else if (monitor_lockout)
               {
-                  Serial_Print("ENABLE LOCKED OUT: disable failed previously. Remove motor power and reset MCU.\r\n");
+                  Serial_Print("ENABLE LOCKED OUT after fault. Cut motor power, investigate, reset MCU.\r\n");
               }
               else
               {
                   CubeMars_Feedback_t snap;
                   CubeMars_GetFeedback(&snap);
-                  enable_test_first_frames = snap.all_frames;
                   if (CubeMars_EnableOnce(&hcan1))
                   {
-                      enable_test_active = 1U;
-                      enable_test_start_ms = HAL_GetTick();
-                      Serial_Print("MIT ENABLE queued for motor 9; DISABLE automatically queued after 1.5 s.\r\n");
+                      monitor_active = 1U;
+                      monitor_stopping = 0U;
+                      monitor_start_ms = HAL_GetTick();
+                      monitor_last_tx_ms = monitor_start_ms;
+                      monitor_initial_rx = snap.matching_frames;
+                      monitor_tx_frames = 0U;
+                      monitor_tx_failures = 0U;
+                      monitor_fault_stop = 0U;
+                      Serial_Print("MIT ENABLE queued: 50Hz zero-gain frames; automatic DISABLE at 10s.\r\n");
                   }
                   else
                   {
-                      Serial_Print("MIT ENABLE NOT queued (CAN mailbox / error).\r\n");
+                      Serial_Print("MIT ENABLE not queued (mailbox/error).\r\n");
                   }
               }
           }
           else if (command == 'd')
           {
-              if (CubeMars_DisableOnce(&hcan1))
-              {
-                  enable_test_active = 0U;
-                  Serial_Print("MIT DISABLE queued.\r\n");
-              }
-              else
-              {
-                  enable_test_disable_fault = 1U;
-                  Serial_Print("MIT DISABLE could not be queued! CUT MOTOR POWER if unsafe.\r\n");
-              }
+              monitor_active = 0U; /* Stop periodic commands immediately. */
+              monitor_stopping = 1U;
+              monitor_last_disable_attempt_ms = HAL_GetTick() - 10U;
+              Serial_Print("Manual DISABLE requested.\r\n");
           }
           else if (command == 't' || command == 'r')
           {
-              if (enable_test_active)
+              if (monitor_active || monitor_stopping)
               {
-                  Serial_Print("Calibration blocked while enable test is active.\r\n");
+                  Serial_Print("Calibration blocked while motor is enabled or stopping.\r\n");
                   continue;
               }
               /* Prevent TIM6 from reading the ADCs during a blocking calibration. */
