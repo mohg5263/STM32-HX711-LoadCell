@@ -1,9 +1,6 @@
 #include "cubemars.h"
 
-/* AK Series Driver Manual V1.0.18, pages 60-63, legacy MIT mode.
- * AK40-10 ranges. Decoded position is not raw encoder counts.
- * Motor only receives a special enable/disable command on explicit UART request.
- */
+/* AK Series Driver Manual V1.0.18: AK40-10 legacy standard-ID MIT. */
 #define AK40_P_MIN (-12.5f)
 #define AK40_P_MAX (12.5f)
 #define AK40_V_MIN (-45.5f)
@@ -11,151 +8,79 @@
 #define AK40_T_MIN (-5.0f)
 #define AK40_T_MAX (5.0f)
 
-static volatile CubeMars_Feedback_t feedback;
+volatile float motor_position_rad = 0.0f;
+volatile float motor_target_rad = 0.0f;
+volatile uint8_t motor_position_valid = 0U;
+volatile uint32_t motor_last_rx_ms = 0U;
+volatile uint32_t motor_rx_count = 0U;
 
-static float decode_u(uint32_t encoded, float min, float max, uint32_t max_encoded)
+static uint16_t encode(float x, float lo, float hi, uint32_t maxval)
 {
-    return min + ((float)encoded * (max - min) / (float)max_encoded);
+    if (x < lo) x = lo;
+    if (x > hi) x = hi;
+    uint32_t raw = (uint32_t)(((x - lo) * (float)maxval) / (hi - lo) + 0.5f);
+    return (uint16_t)(raw > maxval ? maxval : raw);
 }
 
-void CubeMars_ProcessRx(const CAN_RxHeaderTypeDef *header, const uint8_t data[8])
+static uint8_t send_frame(CAN_HandleTypeDef *hcan, const uint8_t bytes[8])
 {
-    if (header == NULL || data == NULL) return;
-    feedback.all_frames++;
-    feedback.last_ide = (uint8_t)(header->IDE == CAN_ID_EXT);
-    feedback.last_dlc = (uint8_t)header->DLC;
-    feedback.last_can_id = (header->IDE == CAN_ID_STD) ? header->StdId : header->ExtId;
-
-    /* Earlier working eight-motor firmware identifies replies by data[0],
-     * not by header.StdId. Accept any standard-ID 8-byte frame with payload
-     * motor ID 9; preserve header ID in diagnostics for verification.
-     */
-    if (header->IDE != CAN_ID_STD || header->RTR != CAN_RTR_DATA)
-    {
-        feedback.other_frames++;
-        return;
-    }
-    if (header->DLC != 8U)
-    {
-        feedback.invalid_frames++;
-        return;
-    }
-    if (data[0] != MOTOR_CAN_ID)
-    {
-        feedback.other_frames++;
-        return;
-    }
-
-    uint32_t p = ((uint32_t)data[1] << 8) | data[2];
-    uint32_t v = ((uint32_t)data[3] << 4) | (data[4] >> 4);
-    uint32_t t = (((uint32_t)data[4] & 0xFU) << 8) | data[5];
-
-    feedback.position_rad = decode_u(p, AK40_P_MIN, AK40_P_MAX, 65535U);
-    feedback.velocity_rad_s = decode_u(v, AK40_V_MIN, AK40_V_MAX, 4095U);
-    feedback.torque_nm = decode_u(t, AK40_T_MIN, AK40_T_MAX, 4095U);
-    feedback.temperature_raw = data[6];
-    feedback.error_raw = data[7];
-    feedback.last_rx_ms = HAL_GetTick();
-    feedback.matching_frames++;
-    feedback.feedback_valid = 1U;
-}
-
-void CubeMars_GetFeedback(CubeMars_Feedback_t *out)
-{
-    if (out == NULL) return;
-    /* Very short critical section to prevent partially copied ISR fields. */
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    out->position_rad = feedback.position_rad;
-    out->velocity_rad_s = feedback.velocity_rad_s;
-    out->torque_nm = feedback.torque_nm;
-    out->temperature_raw = feedback.temperature_raw;
-    out->error_raw = feedback.error_raw;
-    out->last_rx_ms = feedback.last_rx_ms;
-    out->matching_frames = feedback.matching_frames;
-    out->all_frames = feedback.all_frames;
-    out->invalid_frames = feedback.invalid_frames;
-    out->other_frames = feedback.other_frames;
-    out->last_can_id = feedback.last_can_id;
-    out->last_ide = feedback.last_ide;
-    out->last_dlc = feedback.last_dlc;
-    out->feedback_valid = feedback.feedback_valid;
-    __set_PRIMASK(primask);
-}
-
-/* Transmit one legacy-MIT special command; NEVER wait for a mailbox.
- * FC enable, FD disable. Queueing is not proof of delivery or execution.
- */
-static uint8_t CubeMars_SendSpecial(CAN_HandleTypeDef *hcan, uint8_t command)
-{
-    if (hcan == NULL) return 0U;
-    if (HAL_CAN_GetTxMailboxesFreeLevel(hcan) == 0U) return 0U;
-
+    if (hcan == NULL || HAL_CAN_GetTxMailboxesFreeLevel(hcan) == 0U)
+        return 0U;
     CAN_TxHeaderTypeDef header = {0};
-    uint8_t data[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
     uint32_t mailbox;
     header.StdId = MOTOR_CAN_ID;
     header.IDE = CAN_ID_STD;
     header.RTR = CAN_RTR_DATA;
     header.DLC = 8U;
     header.TransmitGlobalTime = DISABLE;
-    data[7] = command;
-    return (HAL_CAN_AddTxMessage(hcan, &header, data, &mailbox) == HAL_OK) ? 1U : 0U;
+    return HAL_CAN_AddTxMessage(hcan, &header, (uint8_t *)bytes, &mailbox) == HAL_OK;
 }
 
-uint8_t CubeMars_EnableOnce(CAN_HandleTypeDef *hcan)
+static uint8_t special(CAN_HandleTypeDef *hcan, uint8_t last_byte)
 {
-    return CubeMars_SendSpecial(hcan, 0xFCU);
+    uint8_t frame[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    frame[7] = last_byte;
+    return send_frame(hcan, frame);
 }
+uint8_t CubeMars_Enable(CAN_HandleTypeDef *hcan) { return special(hcan, 0xFCU); }
+uint8_t CubeMars_Disable(CAN_HandleTypeDef *hcan) { return special(hcan, 0xFDU); }
 
-uint8_t CubeMars_DisableOnce(CAN_HandleTypeDef *hcan)
+static uint8_t send_mit(CAN_HandleTypeDef *hcan, float pos, float kp, float kd)
 {
-    return CubeMars_SendSpecial(hcan, 0xFDU);
-}
-
-/* Reference: user's working eight-actuator legacy MIT protocol:
- * p16 | v12 | kp12 | kd12 | torque12, motor CAN standard ID = 9.
- * This command requests ZERO kp, kd, velocity and feedforward torque.
- * Position field is set to the center of the allowed encoding, but with
- * KP=0 it does not command a position-holding torque.
- * All fields within 0..(2^bits-1). Do not transmit from an interrupt.
- */
-static uint16_t CubeMars_Encode(float val, float low, float high, uint32_t mask)
-{
-    if (val < low) val = low;
-    if (val > high) val = high;
-    float f = (val - low) * (float)mask / (high - low);
-    uint32_t enc = (uint32_t)(f + 0.5f);
-    if (enc > mask) enc = mask;
-    return (uint16_t)enc;
-}
-
-uint8_t CubeMars_SendPassiveMIT(CAN_HandleTypeDef *hcan)
-{
-    if (hcan == NULL || HAL_CAN_GetTxMailboxesFreeLevel(hcan) == 0U)
-        return 0U;
-
-    uint16_t p = CubeMars_Encode(0.0f, AK40_P_MIN, AK40_P_MAX, 65535U);
-    uint16_t v = CubeMars_Encode(0.0f, AK40_V_MIN, AK40_V_MAX, 4095U);
-    uint16_t t = CubeMars_Encode(0.0f, AK40_T_MIN, AK40_T_MAX, 4095U);
-    uint16_t kp = 0U, kd = 0U;
-
-    uint8_t data[8] = {
-        (uint8_t)(p >> 8),
-        (uint8_t)(p & 0xFFU),
-        (uint8_t)(v >> 4),
-        (uint8_t)(((v & 0xFU) << 4) | (kp >> 8)),
-        (uint8_t)(kp & 0xFFU),
-        (uint8_t)(kd >> 4),
-        (uint8_t)(((kd & 0xFU) << 4) | (t >> 8)),
-        (uint8_t)(t & 0xFFU)
+    uint16_t p = encode(pos, AK40_P_MIN, AK40_P_MAX, 65535U);
+    uint16_t v = encode(0.0f, AK40_V_MIN, AK40_V_MAX, 4095U);
+    uint16_t k = encode(kp, 0.0f, 500.0f, 4095U);
+    uint16_t d = encode(kd, 0.0f, 5.0f, 4095U);
+    uint16_t t = encode(0.0f, AK40_T_MIN, AK40_T_MAX, 4095U);
+    uint8_t frame[8] = {
+        (uint8_t)(p >> 8), (uint8_t)p, (uint8_t)(v >> 4),
+        (uint8_t)(((v & 15U) << 4) | (k >> 8)), (uint8_t)k,
+        (uint8_t)(d >> 4), (uint8_t)(((d & 15U) << 4) | (t >> 8)),
+        (uint8_t)t
     };
-    CAN_TxHeaderTypeDef header = {0};
-    uint32_t mailbox = 0;
-    header.StdId = MOTOR_CAN_ID;
-    header.IDE = CAN_ID_STD;
-    header.RTR = CAN_RTR_DATA;
-    header.DLC = 8U;
-    header.TransmitGlobalTime = DISABLE;
-    return (HAL_CAN_AddTxMessage(hcan, &header, data, &mailbox) == HAL_OK) ? 1U : 0U;
+    return send_frame(hcan, frame);
+}
+uint8_t CubeMars_SendPassive(CAN_HandleTypeDef *hcan)
+{
+    return send_mit(hcan, 0.0f, 0.0f, 0.0f);
+}
+uint8_t CubeMars_SendPosition(CAN_HandleTypeDef *hcan, float pos, float kp, float kd)
+{
+    return send_mit(hcan, pos, kp, kd);
+}
+
+/* Decode feedback, 8-byte legacy MIT: motor ID + p16 + v12 + torque12 + extras.
+ * Reported position is NOT necessarily raw single-turn encoder position. */
+void CubeMars_ProcessRx(const CAN_RxHeaderTypeDef *header, const uint8_t data[8])
+{
+    if (header == NULL || data == NULL || header->IDE != CAN_ID_STD ||
+        header->RTR != CAN_RTR_DATA || header->DLC != 8U ||
+        data[0] != MOTOR_CAN_ID)
+        return;
+    uint16_t p = ((uint16_t)data[1] << 8) | (uint16_t)data[2];
+    motor_position_rad = AK40_P_MIN +
+        ((float)p * (AK40_P_MAX - AK40_P_MIN) / 65535.0f);
+    motor_last_rx_ms = HAL_GetTick();
+    motor_rx_count++;
+    motor_position_valid = 1U;
 }
