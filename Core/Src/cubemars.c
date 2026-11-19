@@ -1,4 +1,5 @@
 #include "cubemars.h"
+#include <math.h>
 
 /* AK Series Driver Manual V1.0.18: AK40-10 legacy standard-ID MIT. */
 #define AK40_P_MIN (-12.5f)
@@ -10,6 +11,8 @@
 
 volatile float motor_position_rad = 0.0f;
 volatile float motor_target_rad = 0.0f;
+volatile float motor_kp = 1.0f;
+volatile float motor_kd = 0.2f;
 volatile uint8_t motor_position_valid = 0U;
 volatile uint32_t motor_last_rx_ms = 0U;
 volatile uint32_t motor_rx_count = 0U;
@@ -66,6 +69,10 @@ uint8_t CubeMars_SendPassive(CAN_HandleTypeDef *hcan)
 }
 uint8_t CubeMars_SendPosition(CAN_HandleTypeDef *hcan, float pos, float kp, float kd)
 {
+    if (!isfinite(pos) || pos < AK40_P_MIN || pos > AK40_P_MAX ||
+        !isfinite(kp) || kp < 0.0f || kp > 500.0f ||
+        !isfinite(kd) || kd < 0.0f || kd > 5.0f)
+        return 0U;
     return send_mit(hcan, pos, kp, kd);
 }
 

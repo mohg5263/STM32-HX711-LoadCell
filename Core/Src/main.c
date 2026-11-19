@@ -26,6 +26,7 @@
 #include "cubemars.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -64,6 +65,7 @@ HX711_t loadcell2 = {
     .offset=585800, .scale=97598.601562f
 };
 
+/* CubeMonitor: live axial and horizontal force in lb (read-only). */
 volatile float weight1_lb = 0.0f;
 volatile float weight2_lb = 0.0f;
 volatile uint32_t axial_timestamp_ms = 0U;
@@ -74,8 +76,7 @@ volatile uint32_t control_cycle_count = 0U;
 
 /* Motor configuration. The public motor position/setpoint globals are in
  * cubemars.c and declared extern in cubemars.h for use by other files. */
-#define MOTOR_KP                   1.0f
-#define MOTOR_KD                   0.2f
+/* Kp and Kd are writable globals defined in cubemars.c. */
 #define MOTOR_COMMAND_PERIOD_MS   20U     /* 50 Hz CAN commands */
 #define MOTOR_START_GRACE_MS      700U
 #define MOTOR_FEEDBACK_MAX_AGE_MS 400U
@@ -83,7 +84,10 @@ volatile uint32_t control_cycle_count = 0U;
 #define MOTOR_POSITION_MIN_RAD   (-12.5f) /* MIT protocol range */
 #define MOTOR_POSITION_MAX_RAD    12.5f
 
-static uint8_t motor_active = 0U;
+/* CubeMonitor can READ this status; use motor_command to control it. */
+volatile uint8_t motor_active = 0U;
+/* Write 'e' or 'd' (ASCII 101 or 100) then firmware clears to 0. */
+volatile uint8_t motor_command = 0U;
 static uint8_t motor_target_ready = 0U;
 static uint8_t motor_stop_pending = 0U;
 static uint8_t motor_fault_lockout = 0U;
@@ -123,15 +127,32 @@ static void Motor_RequestStop(uint8_t fault)
 }
 
 /* Each character is a complete command: no Enter and no line parser. */
-static void Process_SerialInput(uint8_t ch)
+static void Process_MotorCommand(uint8_t ch)
 {
     if (ch == 'e')
     {
-        if (motor_active || motor_stop_pending || motor_fault_lockout)
-        {
-            Serial_Print("Motor active, stopping, or locked out.\r\n");
-            return;
-        }
+    	if (motor_active)
+    	{
+    	    Serial_Print("Motor is already enabled.\r\n");
+    	    return;
+    	}
+
+    	if (motor_stop_pending)
+    	{
+    	    Serial_Print("Motor is currently stopping.\r\n");
+    	    return;
+    	}
+
+    	if (motor_fault_lockout)
+    	{
+    	    Serial_Print("Motor is locked out due to a fault.\r\n");
+    	    return;
+    	}
+
+
+
+
+
         motor_rx_count_on_enable = motor_rx_count;
         if (!CubeMars_Enable(&hcan1))
         {
@@ -168,7 +189,7 @@ static void Process_SerialInput(uint8_t ch)
 
         /* Encoding supports only [-12.5, 12.5] rad. This is NOT a
          * relative-displacement or mechanical-travel limit. */
-        if (next < MOTOR_POSITION_MIN_RAD || next > MOTOR_POSITION_MAX_RAD)
+        if (!isfinite(next) || next < MOTOR_POSITION_MIN_RAD || next > MOTOR_POSITION_MAX_RAD)
         {
             Serial_Print("Position exceeds MIT encoding range (+/-12.5 rad).\r\n");
             return;
@@ -244,9 +265,21 @@ if (HAL_TIM_Base_Start(&htim2) != HAL_OK) Error_Handler();
 uint32_t last_print_ms = HAL_GetTick();
   while (1)
   {
-      uint32_t now = HAL_GetTick();
+       uint32_t now = HAL_GetTick();
 
-      if (motor_active)
+       /* Single-slot command mailbox for CubeMonitor: write ASCII 'e' or 'd'.
+        * Clear before processing so the same command does not repeat.
+        * If updated faster than the main loop executes, intermediate writes
+        * can be overwritten; this is intended for manual commands only. */
+       uint8_t pending_command = motor_command;
+       if (pending_command != 0U)
+       {
+           motor_command = 0U;
+           if (pending_command == 'e' || pending_command == 'd')
+               Process_MotorCommand(pending_command);
+       }
+
+       if (motor_active)
       {
           /* Acquire initial target from a NEW response after enable. */
           if (!motor_target_ready && motor_rx_count != motor_rx_count_on_enable &&
@@ -265,12 +298,22 @@ uint32_t last_print_ms = HAL_GetTick();
               Motor_RequestStop(1U);
               Serial_Print("FAULT: CAN bus-off or missing feedback. Requesting disable.\r\n");
           }
+           else if (motor_target_ready &&
+                    (!isfinite(motor_target_rad) ||
+                     motor_target_rad < MOTOR_POSITION_MIN_RAD ||
+                     motor_target_rad > MOTOR_POSITION_MAX_RAD ||
+                     !isfinite(motor_kp) || motor_kp < 0.0f || motor_kp > 500.0f ||
+                     !isfinite(motor_kd) || motor_kd < 0.0f || motor_kd > 5.0f))
+          {
+               Motor_RequestStop(1U);
+               Serial_Print("FAULT: invalid target or gains; requesting disable.\r\n");
+          }
           else if ((uint32_t)(now - motor_last_command_ms) >= MOTOR_COMMAND_PERIOD_MS)
           {
-              motor_last_command_ms = now;
-              uint8_t ok = motor_target_ready ?
-                  CubeMars_SendPosition(&hcan1, motor_target_rad, MOTOR_KP, MOTOR_KD) :
-                  CubeMars_SendPassive(&hcan1);
+               motor_last_command_ms = now;
+               uint8_t ok = motor_target_ready ?
+                   CubeMars_SendPosition(&hcan1, motor_target_rad, motor_kp, motor_kd) :
+                   CubeMars_SendPassive(&hcan1);
               if (!ok)
               {
                   Motor_RequestStop(1U);
@@ -310,7 +353,7 @@ uint32_t last_print_ms = HAL_GetTick();
       /* 1 ms receive timeout; each keypress is handled immediately. */
       uint8_t ch;
       if (HAL_UART_Receive(&huart2, &ch, 1U, 1U) == HAL_OK)
-          Process_SerialInput(ch);
+    	  Process_MotorCommand(ch);
   /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

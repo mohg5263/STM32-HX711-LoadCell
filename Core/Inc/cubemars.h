@@ -12,6 +12,16 @@
  * These are RAM variables, not persistent after MCU power-off. */
 extern volatile float motor_position_rad;
 extern volatile float motor_target_rad;
+/* Writable in CubeMonitor: MIT Kp [0,500], Kd [0,5]. */
+extern volatile float motor_kp;
+extern volatile float motor_kd;
+/* CubeMonitor command: ASCII 'e'=101, 'd'=100; cleared after use.
+ * motor_active is read-only status (0=disabled, 1=enabled). */
+extern volatile uint8_t motor_command;
+extern volatile uint8_t motor_active;
+/* Load-cell outputs are globals defined in main.c (units: lb). */
+extern volatile float weight1_lb;
+extern volatile float weight2_lb;
 extern volatile uint8_t motor_position_valid;
 extern volatile uint32_t motor_last_rx_ms;
 extern volatile uint32_t motor_rx_count;
